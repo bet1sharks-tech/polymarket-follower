@@ -3,6 +3,7 @@ import axios from 'axios';
 interface Activity {
     id: string;
     type: string;
+    proxyType?: string;
     timestamp: number;
     marketSlug?: string;
     title?: string;
@@ -32,7 +33,6 @@ export class PolymarketClient {
     constructor(userAddress: string) {
         this.userAddress = userAddress;
         // Initialize last checked as current time to avoid spamming old notifications on startup
-        // Or set to 0 if you want to see the last few actions immediately for testing
         this.lastCheckedTimestamp = Math.floor(Date.now() / 1000);
     }
 

@@ -1,63 +1,49 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { config } from './config';
-import { PolymarketClient, Position } from './polymarket';
+import { PolymarketClient } from './polymarket';
 import { TelegramNotifier } from './telegram';
-
-const DATA_DIR = path.join(process.cwd(), '.data');
-const PERSISTENCE_FILE = path.join(DATA_DIR, 'notified_positions.json');
-
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR);
-}
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-function loadNotifiedPositions(): Set<string> {
-    try {
-        if (fs.existsSync(PERSISTENCE_FILE)) {
-            const data = fs.readFileSync(PERSISTENCE_FILE, 'utf8');
-            const ids = JSON.parse(data);
-            console.log(`Loaded ${ids.length} already notified positions.`);
-            return new Set(ids);
-        }
-    } catch (error) {
-        console.error('Error loading notified positions:', error);
-    }
-    return new Set();
-}
-
-function saveNotifiedPosition(currentIds: Set<string>) {
-    try {
-        const ids = Array.from(currentIds);
-        const tempFile = `${PERSISTENCE_FILE}.tmp`;
-        fs.writeFileSync(tempFile, JSON.stringify(ids, null, 2));
-        fs.renameSync(tempFile, PERSISTENCE_FILE);
-        console.log(`[Persistence] Saved ${ids.length} positions to disk.`);
-    } catch (error) {
-        console.error('[Persistence] Error saving notified positions:', error);
-    }
-}
-
 async function main() {
-    console.log('Starting Polymarket Follower (Position Monitor)...');
+    console.log('Starting Polymarket Follower (Activity Monitor)...');
     console.log(`Tracking Wallet: ${config.targetWalletAddress}`);
     console.log(`Poll Interval: ${config.pollIntervalMs}ms`);
 
     const polyClient = new PolymarketClient(config.targetWalletAddress);
     const telegramBot = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
 
-    // Load persisted conditionIds
-    const notifiedPositions = loadNotifiedPositions();
+    // Startup Message
+    await telegramBot.sendMessage(`🟢 <b>Bot Started</b>\nI am running at the moment and monitoring wallet: <code>${config.targetWalletAddress}</code>`);
 
     let consecutiveErrors = 0;
     let lastHeartbeat = Date.now();
     const HEARTBEAT_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 
+    // Handle Shutdown/Crash
+    const handleExit = async (reason: string) => {
+        console.log(`[Exit] ${reason}`);
+        try {
+            await telegramBot.sendMessage(`🔴 <b>Bot Stopped</b>\nWarning: The bot has stopped working. Reason: <code>${reason}</code>`);
+        } catch (err) {
+            console.error('Failed to send exit message:', err);
+        }
+        process.exit(reason === 'Crash' ? 1 : 0);
+    };
+
+    process.on('SIGINT', () => handleExit('Terminated (User)'));
+    process.on('SIGTERM', () => handleExit('Terminated (System)'));
+    process.on('uncaughtException', (err) => {
+        console.error('Uncaught Exception:', err);
+        handleExit('Crash (Uncaught Exception)');
+    });
+    process.on('unhandledRejection', (reason) => {
+        console.error('Unhandled Rejection:', reason);
+        handleExit('Crash (Unhandled Rejection)');
+    });
+
     const poll = async () => {
         try {
-            console.log(`[${new Date().toISOString()}] Polling positions...`);
+            console.log(`[${new Date().toISOString()}] Checking for new activities...`);
 
             // Check for Daily Heartbeat
             if (Date.now() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
@@ -65,52 +51,43 @@ async function main() {
                 lastHeartbeat = Date.now();
             }
 
-            const positions = await polyClient.fetchPositions();
+            const activities = await polyClient.fetchNewActivity();
 
             // Success! Reset consecutive errors
             consecutiveErrors = 0;
 
-            // Filter for positions:
-            // 1. Value >= $5000
-            // 2. Not already notified (using asset ID)
-            // 3. Price is between 0.10 and 0.90
-            const largePositions = positions.filter((p: Position) => {
-                const isLarge = p.currentValue >= 5000;
-                const isNew = !notifiedPositions.has(p.asset);
+            // Filter for activities:
+            // 1. Type is BUY
+            // 2. Value (size * price) > $1000
+            const buyActivities = activities.filter((a: any) => {
+                const isBuy = a.side?.toUpperCase() === 'BUY';
+                const value = (a.size || 0) * (a.price || 0);
+                const isHighValue = value >= 1000;
 
-                // Use avgPrice or curPrice, filtered between 0.10 and 0.90
-                const price = p.averagePrice || p.price || 0;
-                const isPriceInRange = price >= 0.10 && price <= 0.90;
-
-                if (isLarge && isNew && !isPriceInRange) {
-                    console.log(`[Filter] Skipping "${p.title}" (${p.outcome}): Price $${price.toFixed(2)} outside 0.10-0.90 range.`);
+                if (isBuy && !isHighValue) {
+                    console.log(`[Filter] Skipping small BUY: ${a.title} - Value: $${value.toFixed(2)}`);
                 }
 
-                return isLarge && isNew && isPriceInRange;
+                return isBuy && isHighValue;
             });
 
-            if (largePositions.length > 0) {
-                console.log(`[Filter] Found ${largePositions.length} new high-value positions to notify!`);
-                for (const pos of largePositions) {
-                    const message = formatPositionMessage(pos);
-                    console.log(`[Telegram] Sending alert for: ${pos.title} (${pos.outcome}) - Value: $${pos.currentValue.toFixed(2)}`);
+            if (buyActivities.length > 0) {
+                console.log(`[Filter] Found ${buyActivities.length} new high-value BUY activities!`);
+                for (const activity of buyActivities) {
+                    const message = formatActivityMessage(activity);
+                    console.log(`[Telegram] Sending alert for BUY: ${activity.title} - Value: $${((activity.size || 0) * (activity.price || 0)).toFixed(2)}`);
                     await telegramBot.sendMessage(message);
 
-                    notifiedPositions.add(pos.asset);
-                    saveNotifiedPosition(notifiedPositions);
-
-                    // Delay between messages to avoid Telegram 429 (Rate Limit)
+                    // Delay between messages to avoid Telegram 429
                     await sleep(2000);
                 }
-            } else {
-                console.log('[Filter] No new high-value positions matched criteria.');
             }
         } catch (error) {
             console.error('Error in poll loop:', error);
             consecutiveErrors++;
 
             if (consecutiveErrors === 3) {
-                await telegramBot.sendMessage(`⚠️ <b>Warning: Connection Issues</b>\nThe bot has failed to reach Polymarket 3 times in a row (approx. 15 mins). It will keep trying, but you may want to check the server.`);
+                await telegramBot.sendMessage(`⚠️ <b>Warning: Connection Issues</b>\nThe bot has failed to reach Polymarket 3 times in a row. It will keep trying.`);
             }
         } finally {
             setTimeout(poll, config.pollIntervalMs);
@@ -119,6 +96,23 @@ async function main() {
 
     // Start the polling loop
     poll();
+}
+
+function formatActivityMessage(activity: any): string {
+    const title = activity.title || 'Unknown Market';
+    const outcome = activity.outcome || 'Unknown Outcome';
+    const size = activity.size || 0;
+    const price = activity.price || 0;
+    const value = (size * price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+    const americanOdds = toAmericanOdds(price);
+
+    return `🚀 <b>New High-Value BUY Detected!</b>\n\n` +
+        `🏆 Market: <b>${title}</b>\n` +
+        `🎯 Side: <b>${outcome}</b>\n\n` +
+        `💰 Total Value: <b>${value}</b>\n` +
+        `📊 Size: ${size.toLocaleString()} tokens\n` +
+        `🏷 Price: $${price.toFixed(2)} (${americanOdds})\n\n` +
+        `<i>Wallet Activity: ${config.targetWalletAddress}</i>`;
 }
 
 function toAmericanOdds(price: number): string {
@@ -134,27 +128,6 @@ function toAmericanOdds(price: number): string {
         const odds = Math.round(-100 / (decimalOdds - 1));
         return `${odds}`; // Already includes minus sign
     }
-}
-
-function formatPositionMessage(pos: Position): string {
-    const title = pos.title || 'Unknown Market';
-    const outcome = pos.outcome || 'Unknown Outcome';
-    const value = pos.currentValue.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-
-    // Use averagePrice if entry price, or price if current price
-    const entryPrice = pos.averagePrice || pos.price || 0;
-    const americanOdds = toAmericanOdds(entryPrice);
-    const priceDisplay = entryPrice > 0 ? `$${entryPrice.toFixed(2)} (${americanOdds})` : '$NaN';
-
-    const tokens = pos.tokens.toLocaleString('en-US');
-
-    return `🔥 <b>High-Value Position Detected!</b>\n\n` +
-        `🏆 Market: <b>${title}</b>\n` +
-        `🎯 Betting on: <b>${outcome}</b>\n\n` +
-        `💰 Current Value: <b>${value}</b>\n` +
-        `📊 Size: ${tokens} tokens\n` +
-        `🏷 Entry Price: ${priceDisplay}\n\n` +
-        `<i>Tracking: ${config.targetWalletAddress}</i>`;
 }
 
 main().catch(console.error);
